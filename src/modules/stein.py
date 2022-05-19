@@ -1,8 +1,11 @@
+import os
+
 import torch
 import time
+from pathlib import Path
 
 from cdt.utils.R import launch_R_script
-from modules.utils import *
+from .utils import *
 
 
 def Stein_hess_diag(X, eta_G, eta_H, s = None):
@@ -11,16 +14,16 @@ def Stein_hess_diag(X, eta_G, eta_H, s = None):
     X, using first and second-order Stein identities
     """
     n, d = X.shape
-    
+
     X_diff = X.unsqueeze(1)-X
     if s is None:
         D = torch.norm(X_diff, dim=2, p=2)
         s = D.flatten().median()
     K = torch.exp(-torch.norm(X_diff, dim=2, p=2)**2 / (2 * s**2)) / s
-    
+
     nablaK = -torch.einsum('kij,ik->kj', X_diff, K) / s**2
     G = torch.matmul(torch.inverse(K + eta_G * torch.eye(n)), nablaK)
-    
+
     nabla2K = torch.einsum('kij,ik->kj', -1/s**2 + X_diff**2/s**4, K)
     return -G**2 + torch.matmul(torch.inverse(K + eta_H * torch.eye(n)), nabla2K)
 
@@ -54,19 +57,19 @@ def Stein_hess_matrix(X, s, eta):
         Hess: N x D x D hessian estimator of log(p(x))
     """
     n, d = X.shape
-    
+
     X_diff = X.unsqueeze(1)-X
     K = torch.exp(-torch.norm(X_diff, dim=2, p=2)**2 / (2 * s**2)) / s
-    
+
     nablaK = -torch.einsum('ikj,ik->ij', X_diff, K) / s**2
     G = torch.matmul(torch.inverse(K + eta * torch.eye(n)), nablaK)
-    
+
     # Compute the Hessian by column stacked together
     Hess = Stein_hess_col(X_diff, G, K, 0, s, eta, n) # Hessian of col 0
     Hess = Hess[:, None, :]
     for v in range(1, d):
         Hess = torch.hstack([Hess, Stein_hess_col(X_diff, G, K, v, s, eta, n)[:, None, :]])
-    
+
     return Hess
 
 # Try to compute Hess once and remove nodes each time
@@ -96,17 +99,17 @@ def compute_top_order(X, eta_G, eta_H, normalize_var=True, dispersion="var"):
 
 def Stein_hess_parents(X, s, eta, l):
     n, d = X.shape
-    
+
     X_diff = X.unsqueeze(1)-X
     K = torch.exp(-torch.norm(X_diff, dim=2, p=2)**2 / (2 * s**2)) / s
-    
+
     nablaK = -torch.einsum('ikj,ik->ij', X_diff, K) / s**2
     G = torch.matmul(torch.inverse(K + eta * torch.eye(n)), nablaK) # Expected: n x d, Ok
     Gl = torch.einsum('i,ij->ij', G[:,l], G)
-    
+
     nabla2lK = torch.einsum('ik,ikj,ik->ij', X_diff[:,:,l], X_diff, K) / s**4
     nabla2lK[:,l] -= torch.einsum("ik->i", K) / s**2
-    
+
     return -Gl + torch.matmul(torch.inverse(K + eta * torch.eye(n)), nabla2lK)
 
 
@@ -147,7 +150,7 @@ def fast_pruning(X, top_order, eta_G, threshold):
     """
     d = X.shape[1]
     remaining_nodes = list(range(d))
-    s = heuristic_kernel_width(X.detach()) # This actually changes at each iteration 
+    s = heuristic_kernel_width(X.detach()) # This actually changes at each iteration
     hess = Stein_hess_matrix(X, s, eta_G)
 
     # TODO: Enforce acyclicity
@@ -188,7 +191,7 @@ def K_fast_pruning(K, X, top_order, eta_G, threshold):
     K = K+1 # To account for A[l, l] = 0
     d = X.shape[1]
     remaining_nodes = list(range(d))
-    s = heuristic_kernel_width(X.detach()) # This actually changes at each iteration 
+    s = heuristic_kernel_width(X.detach()) # This actually changes at each iteration
     hess = Stein_hess_matrix(X, s, eta_G)
 
     A = np.zeros((d,d))
@@ -205,17 +208,14 @@ def K_fast_pruning(K, X, top_order, eta_G, threshold):
         hess_remaining = hess_remaining[:, :, remaining_nodes]
         hess_l = hess_remaining[:, remaining_nodes.index(l), :]
         parents = []
-        hess_m = torch.abs(torch.median(hess_l, dim=0).values)
-        # hess_m = torch.abs(hess_l.mean(dim=0))
-        
-        t = hess_m.mean()
-        K = min(K, len(remaining_nodes))
-        topk_values, topk_indices = torch.topk(hess_m, K, sorted=False)
-        for j in range(K):
-            if topk_values[j] > max(threshold, t):
-                node = topk_indices[j]
-                if top_order[node] != l: # ?!
-                    parents.append(remaining_nodes[node])
+        # hess_m = torch.abs(torch.median(hess_l, dim=0).values)
+        hess_m = torch.abs(hess_l.mean(dim=0))
+        m_values, m_indices = hess_m.sort(descending=True)
+        for j in range(0, min(K, len(m_values))):
+            if m_values[j] > threshold:
+                node = m_indices[j]
+            if top_order[node] != l: # ?!
+                parents.append(remaining_nodes[node])
 
         A[parents, l] = 1
         A[l, l] = 0
@@ -230,19 +230,19 @@ def fullAdj2Order(A):
     return order
 
 
-def cam_pruning(A, X, cutoff, prune_only=True, pns=False):
-    save_path = "./"
+def cam_pruning(A, X, cutoff, prune_only=True, pns=False, verbose=True):
+    save_path = Path(__file__).resolve()
 
 
     data_np = np.array(X.detach().cpu().numpy())
-    data_csv_path = np_to_csv(data_np, save_path)
-    dag_csv_path = np_to_csv(A, save_path) 
+    data_csv_path = np_to_csv(data_np, str(save_path))
+    dag_csv_path = np_to_csv(A, str(save_path))
 
     arguments = dict()
     arguments['{PATH_DATA}'] = data_csv_path
     arguments['{PATH_DAG}'] = dag_csv_path
-    arguments['{PATH_RESULTS}'] = os.path.join(save_path, "results.csv")
-    arguments['{ADJFULL_RESULTS}'] = os.path.join(save_path, "adjfull.csv")
+    arguments['{PATH_RESULTS}'] = str(save_path.parent / f"results_{uuid.uuid4()}.csv")
+    arguments['{ADJFULL_RESULTS}'] = str(save_path.parent / f"adjfull_{uuid.uuid4()}.csv")
     arguments['{CUTOFF}'] = str(cutoff)
     arguments['{VERBOSE}'] = "TRUE"
     print(arguments)
@@ -254,30 +254,31 @@ def cam_pruning(A, X, cutoff, prune_only=True, pns=False):
             os.remove(arguments['{PATH_DATA}'])
             os.remove(arguments['{PATH_DAG}'])
             return A
-        dag = launch_R_script("../R_code/cam_pruning.R", arguments, output_function=retrieve_result)
+        cam_pruning_r_path = (Path(__file__).parents[2] / "R_code/cam_pruning.R").resolve()
+        dag = launch_R_script(str(cam_pruning_r_path), arguments, output_function=retrieve_result, verbose=verbose)
         return dag
     else:
         def retrieve_result():
             A = pd.read_csv(arguments['{PATH_RESULTS}']).values
             Afull = pd.read_csv(arguments['{ADJFULL_RESULTS}']).values
-            
+
             return A, Afull
         dag, dagFull = launch_R_script("/Users/user/Documents/EPFL/PHD/Causality/score_based/CAM.R", arguments, output_function=retrieve_result)
         top_order = fullAdj2Order(dagFull)
         return dag, top_order
-        
-  
-def SCORE(X, eta_G=0.001, eta_H=0.001, cutoff=0.001, normalize_var=False, dispersion="var", pruning = 'CAM', threshold=0.1, pns=None, K=None):
+
+
+def SCORE(X, eta_G=0.001, eta_H=0.001, cutoff=0.001, normalize_var=False, dispersion="var", pruning = 'CAM', threshold=0.1, pns=None, K=None, verbose=True):
     start_time = time.time()
     top_order = compute_top_order(X, eta_G, eta_H, normalize_var, dispersion)
     SCORE_time = time.time() - start_time
-    
+
     start_time = time.time()
     if pruning == 'CAM':
         if pns is None:
-            A_SCORE = cam_pruning(full_DAG(top_order), X, cutoff)
-        else: 
-            A_SCORE = cam_pruning(pns_(full_DAG(top_order), X, pns, thresh=1), X, cutoff)
+            A_SCORE = cam_pruning(full_DAG(top_order), X, cutoff, verbose=verbose)
+        else:
+            A_SCORE = cam_pruning(pns_(full_DAG(top_order), X, pns, thresh=1), X, cutoff, verbose=verbose)
     elif pruning == 'Stein':
         A_SCORE = Stein_pruning(X, top_order, eta_G, threshold = threshold)
     elif pruning == "Fast" and K is None:
@@ -285,7 +286,7 @@ def SCORE(X, eta_G=0.001, eta_H=0.001, cutoff=0.001, normalize_var=False, disper
     elif pruning == "Fast" and K is not None:
         A_SCORE = K_fast_pruning(K, X, top_order, eta_G, threshold=threshold)
     elif "FastCAM": #CAMFast
-        A_SCORE = cam_pruning(fast_pruning(X, top_order, eta_G, threshold=threshold), X, cutoff)
+        A_SCORE = cam_pruning(fast_pruning(X, top_order, eta_G, threshold=threshold), X, cutoff, verbose=verbose)
     else:
         raise Exception("Unknown pruning method")
 
@@ -294,7 +295,7 @@ def SCORE(X, eta_G=0.001, eta_H=0.001, cutoff=0.001, normalize_var=False, disper
 
 def sortnregress(X, cutoff=0.001):
     var_order = np.argsort(X.var(axis=0))
-    
+
     return cam_pruning(full_DAG(var_order), X, cutoff), var_order
 
 

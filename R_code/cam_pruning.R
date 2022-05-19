@@ -1,10 +1,11 @@
 #library(CAM)
 library(mgcv)
 
-source("../R_code/train_gam.R")
-source("../R_code/selGam.R")
+dirnameRscripts <- dirname(dirname(dirname("{PATH_DATA}")))
+source(file.path(dirnameRscripts, "R_code/train_gam.R"))
+source(file.path(dirnameRscripts, "R_code/selGam.R"))
 #source("selGamBoost.R")
-source("../R_code/pruning.R")
+source(file.path(dirnameRscripts, "R_code/pruning.R"))
 
 
 dataset <- read.csv(file='{PATH_DATA}', header=FALSE, sep=",")
